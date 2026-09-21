@@ -1,0 +1,58 @@
+# ---- media -------------------------------------------------------------------
+# Never commit sources or output. Some of these are tens of gigabytes.
+# Video
+*.mp4
+*.mov
+*.mkv
+*.m4v
+*.ts
+*.m2ts
+*.mts
+*.avi
+*.wmv
+*.flv
+*.webm
+*.mxf
+*.braw
+*.r3d
+*.dv
+# Audio
+*.wav
+*.aif
+*.aiff
+*.mp3
+*.aac
+*.flac
+*.m4a
+# Intermediates produced by this tool
+*.gray
+*.part.*
+*.preflight.*
+
+# ---- third-party binaries ----------------------------------------------------
+# Do NOT commit ffmpeg. Distributing it brings its own licence obligations
+# (for a GPL build: conveying the corresponding source or a written offer).
+# Users install ffmpeg themselves. See README, "Third-party software".
+*.exe
+*.dll
+*.so
+*.dylib
+
+# ---- this tool's working files -----------------------------------------------
+merge_work/
+*_log.txt
+exported/
+
+# ---- verification output -----------------------------------------------------
+verify/
+*.jpg
+*.jpeg
+*.png
+
+# ---- editors / OS --------------------------------------------------------------
+Thumbs.db
+desktop.ini
+.DS_Store
+*.swp
+.vscode/
+.idea/
