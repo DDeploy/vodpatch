@@ -3,6 +3,9 @@
 Recover the missing beginning of a local recording from a stream VOD, and put
 it back on the front — without re-encoding the master.
 
+<img width="1115" height="628" alt="image" src="https://github.com/user-attachments/assets/9db1b2ad-01ee-4f5c-9414-e65c88e73b7e" />
+
+
 ## Quick start
 
 1. Download the ZIP (green **Code** button → **Download ZIP**) and extract it
