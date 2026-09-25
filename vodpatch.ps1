@@ -107,14 +107,15 @@ $StartCwd = (Get-Location).ProviderPath
 function Resolve-UserPath([string]$p) {
     # Resolve a user-supplied path against the directory the user launched
     # from, NOT against the work directory we Push-Location into below. A bare
-    # "merged.mp4" must not quietly land inside merge_work on the source card.
+    # "merged.mp4" must not quietly land inside merge_work on the source drive.
     if (-not $p) { return "" }
     if (-not [System.IO.Path]::IsPathRooted($p)) { $p = Join-Path $StartCwd $p }
     return [System.IO.Path]::GetFullPath($p)
 }
 
-# The card gets a different drive letter on every machine it is plugged into,
-# so derive the root from where this script actually lives. A typed -Root is
+# The tool can be unzipped anywhere - a USB stick, a memory card, a downloads
+# folder - and a removable drive gets a different letter on every machine, so
+# derive the root from where this script actually lives. A typed -Root is
 # made absolute like every other path: a relative one ("-Root .") used to be
 # re-read from inside merge_work after the Push-Location below, so the analysis
 # looked for its own files in merge_work\merge_work and reported NO MATCH.
@@ -125,12 +126,13 @@ else { $Root = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $M
 if (-not $Root.EndsWith("\")) { $Root += "\" }
 
 # Whether the user named the files. A path the user TYPED is shown back in any
-# error about it; the built-in fallback names never are - they mean nothing to
-# anyone but the tool's first user, and the folder scan is what matters.
+# error about it; the fallback names below never are - normally the folder scan
+# (Find-Sources) finds the files, and these names are only the documented way
+# out when the two files are too close in size for it to tell them apart.
 $VodGiven    = -not [string]::IsNullOrWhiteSpace($Vod)
 $MasterGiven = -not [string]::IsNullOrWhiteSpace($Master)
-$Vod     = if ($Vod)    { Resolve-UserPath $Vod }    else { Join-Path $Root "twitch.mp4" }
-$Master  = if ($Master) { Resolve-UserPath $Master } else { Join-Path $Root "HyperDeck_0001.mp4" }
+$Vod     = if ($Vod)    { Resolve-UserPath $Vod }    else { Join-Path $Root "vod.mp4" }
+$Master  = if ($Master) { Resolve-UserPath $Master } else { Join-Path $Root "master.mp4" }
 $WorkDir = if ($Work)   { Resolve-UserPath $Work }   else { Join-Path $Root "merge_work" }
 
 # Finished files go in their own folder rather than loose next to the script,
@@ -582,8 +584,9 @@ function Find-Sources() {
 # One rule for when to guess, shared by the stages and the menu so the two can
 # never disagree: nothing typed, and the default names are not both present.
 # (The stages used to guess only when NEITHER default existed, so a folder with
-# HyperDeck_0001.mp4 plus a differently named VOD worked in the menu and failed
-# from the command line with an untrue "could not tell which two".)
+# a master under the default name plus a differently named VOD worked in the
+# menu and failed from the command line with an untrue "could not tell which
+# two".)
 function Test-ShouldGuess() {
     return (-not $MasterGiven -and -not $VodGiven -and
             -not ((Test-Path -LiteralPath $Master) -and (Test-Path -LiteralPath $Vod)))
@@ -628,6 +631,8 @@ function Require-Inputs() {
     } else {
         Log "       could not tell which two of these to use:"
         foreach ($o in $others) { Log ("         {0,-44} {1,8:N2} GB" -f $o.Name, ($o.Length/1GB)) }
+        Log "       (the local recording has to be at least twice the VOD's size to be"
+        Log "       told apart by size - otherwise rename them master.mp4 and vod.mp4)"
     }
     Log ""
     Log "You need two recordings of the same session: the local one, and the"
@@ -1049,7 +1054,7 @@ $MinOffset = 0.1
 #   $HitNear  - or near-perfect outright: on very calm footage the true match
 #     sits at the encoding noise (0.22) while the moment's own motion is barely
 #     above it (self 0.12-0.2), so no ratio could accept it.
-# Measured over 149 cases with known answers (both real jobs and their
+# Measured over 149 cases with known answers (two real recordings and their
 # 720p30 / range / overlay / 30 s-overlap variants, a loop, a mirror, facecam
 # composites at 4 sizes x 4 cut points x 4 overlaps with and without audio, a
 # calm talking head, stills): 0 wrong verifications and the true frame
@@ -1403,7 +1408,7 @@ function Get-EncodeArgs($v, $a) {
     # stopping short of it. Video is constant frame rate so it ends on a frame
     # boundary, audio ends on a sample boundary, and the container duration is
     # whichever ends last - which is where the concat demuxer puts the join.
-    # Measured on the real job: 13.15 ms of discontinuity at the seam without
+    # Measured on a real merge: 13.15 ms of discontinuity at the seam without
     # this, 0.5 ms with it. "-t" on the output trims the padding back, so no
     # silence is actually added.
     $achain = @("asetpts=PTS-STARTPTS")
@@ -2477,8 +2482,8 @@ if ($Stage -eq "seamtest") {
     # streams is shorter, and a VOD's audio track is routinely a few tens of
     # milliseconds shorter than the video for a given window, because the two
     # tracks start at different times. The padding lands exactly on the cut and
-    # is audible as a click. Measured on the real job at the default 90s
-    # setting: 22.6 ms of digital silence at the seam without these trims,
+    # is audible as a click. Measured on a real merge with 90 s on each side
+    # of the cut: 22.6 ms of digital silence at the seam without these trims,
     # 2.3 ms with them - and the 2.3 ms is quiet content, not a hole.
     #
     # apad before atrim guarantees the audio can actually reach the trim point;

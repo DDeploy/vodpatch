@@ -61,7 +61,7 @@ it — see [Third-party software](#third-party-software).
 
 There is nothing to install and no fixed location. Extract the folder wherever
 you want and run it from there — everything resolves relative to the script,
-so it works from a USB stick, a desktop folder, or straight onto the card
+so it works from a USB stick, a desktop folder, or a recorder's memory card
 beside your footage. Folder names with spaces, accents and parentheses are
 fine, including the `vodpatch-main (1)` a second download gives you.
 
@@ -92,6 +92,12 @@ It always prints which two it chose, so you can see if it guessed wrong. To
 override: press `[F]` in the menu and pick from the list it shows, or pass
 `-Vod` and `-Master` explicitly. Relative paths resolve against wherever you
 launched from.
+
+The guess needs the local recording to be at least twice the size of the VOD —
+anything closer is not a safe guess, and the script says it could not tell
+the two apart. Then choose them with `[F]` or `-Vod` / `-Master`, or simply
+rename them `master.mp4` and `vod.mp4`: those two names are always taken as
+they are.
 
 **Where the results go.** Finished files land in an `exported` folder next to
 the script — `full_recording.mp4` from a merge, `seam_test.mp4` from a seam
@@ -161,7 +167,7 @@ vodpatch.bat analyze
 powershell -File vodpatch.ps1 -Stage analyze -Vod "D:\vod.mp4" -Master "D:\master.mp4"
 ```
 
-It reports something like this (a real run on a near-static interview):
+It reports something like this (here, a recording of a near-static interview):
 
 ```
 Step 1/3 - sound: the loudness of the master's first 90 s, searched through the whole VOD...
@@ -571,7 +577,7 @@ length.
   unchanged.
 * **You may hear a faint tick at the join.** Two different encodings of the
   same moment are butted together at a single sample, and their waveforms are
-  never bit-identical, so there is a step. Measured on the real job, the step
+  never bit-identical, so there is a step. Measured on a real merge, the step
   at the cut is about 4x a normal sample-to-sample change: audible as a small
   tick, not a dropout. Removing it would mean crossfading across the boundary,
   which means re-encoding the master's audio — the one thing this tool exists
