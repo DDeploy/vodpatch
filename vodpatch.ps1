@@ -1345,6 +1345,25 @@ $ProfileMap = @{
 # ffprobe reports a DECODER name; a few of those are not encoder names.
 $AudioEncMap = @{ "mp3" = "libmp3lame"; "vorbis" = "libvorbis"; "opus" = "libopus" }
 
+# The recovered opening's sound is re-encoded, so it must never be encoded
+# BELOW what either source had. Left to ffmpeg's default, AAC came out at
+# 128 kbit/s from a VOD at 249 and a master at 271 kbit/s: the opening's sound
+# lost quality a second time, on top of Twitch's own encode. The rate is the
+# higher of the two sources, at least 192 kbit/s, rounded up to a multiple of
+# 32. A lossless target (PCM, FLAC, ALAC) takes no bitrate at all.
+function Get-AudioBitrate($a, $vodInfo) {
+    $lossy = @("aac", "mp3", "libmp3lame", "ac3", "eac3", "mp2", "opus", "libopus", "vorbis", "libvorbis")
+    if ($lossy -notcontains [string]$a.codec_name) { return 0 }
+    $want = 192000.0
+    if ($a.bit_rate -and [double]$a.bit_rate -gt $want) { $want = [double]$a.bit_rate }
+    $va = $null
+    if ($vodInfo) { $va = Get-AudioStream $vodInfo }
+    if ($va -and $va.bit_rate -and [double]$va.bit_rate -gt $want) { $want = [double]$va.bit_rate }
+    $k = [long]([Math]::Ceiling($want / 32000.0) * 32)
+    if ($k -gt 512) { $k = 512 }
+    return $k
+}
+
 function Get-EncodeArgs($v, $a) {
     # NOTE: not named $args. CONSTRAINT 8 -- $args is a reserved automatic
     # variable in PowerShell; using it as a local name corrupted the encoder
@@ -1593,11 +1612,15 @@ function New-Opening([double]$offset, $v, $a) {
     $rp = ([string]$v.r_frame_rate) -split '/'
     $nFrames = [long][Math]::Round($offset * [double]$rp[0] / [double]$rp[1])
 
-    # timescale=, frames= and streams= are in the stamp so that an opening
-    # cached by an older version (x264's own timescale, one frame too many, the
-    # VOD's data track and chapters) is rebuilt rather than reused.
-    $stamp = ("offset={0}|audioshift={1}|vod={2}|vodsize={3}|timescale={4}|frames={5}|streams=v,a" -f `
-              (F $offset), (F $AudioShift), $Vod, (FI (Get-Item -LiteralPath $Vod).Length), (FI $ts), (FI $nFrames))
+    $vi = Probe $Vod
+    $abK = Get-AudioBitrate $a $vi                    # kbit/s, 0 = lossless target
+
+    # timescale=, frames=, streams= and abitrate= are in the stamp so that an
+    # opening cached by an older version (x264's own timescale, one frame too
+    # many, the VOD's data track and chapters, 128 kbit/s sound) is rebuilt
+    # rather than reused.
+    $stamp = ("offset={0}|audioshift={1}|vod={2}|vodsize={3}|timescale={4}|frames={5}|streams=v,a|abitrate={6}" -f `
+              (F $offset), (F $AudioShift), $Vod, (FI (Get-Item -LiteralPath $Vod).Length), (FI $ts), (FI $nFrames), (FI $abK))
 
     $reuse = $false
     if ((Test-Path -LiteralPath $seg) -and $Force) {
@@ -1641,7 +1664,6 @@ function New-Opening([double]$offset, $v, $a) {
         # clip itself, and players size the timeline to it.
         $inArgs  = @("-i", $Vod)
         $mapArgs = @("-map", "0:v:0")
-        $vi = Probe $Vod
         if ($vi -and (Get-AudioStream $vi)) {
             $mapArgs += @("-map", "0:a:0")
         } else {
@@ -1655,6 +1677,10 @@ function New-Opening([double]$offset, $v, $a) {
         $mapArgs += @("-dn", "-sn", "-map_chapters", "-1")
         $tsArgs = @()
         if ($ts -gt 0) { $tsArgs = @("-video_track_timescale", (FI $ts)) }
+        if ($abK -gt 0) {
+            $tsArgs += @("-b:a", ((FI $abK) + "k"))
+            Log ("  sound: {0} kbit/s (never below the master's or the VOD's own rate)" -f (FI $abK))
+        }
         if (-not (FF (@("-y", "-hide_banner", "-loglevel", "warning") + $TsFix + $inArgs +
                       @("-t", (F $offset), "-frames:v", (FI $nFrames)) + $mapArgs + $encArgs + $tsArgs + @($part)) "opening encode")) {
             Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue

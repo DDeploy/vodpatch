@@ -292,6 +292,29 @@ The merge:
    AAC encoder priming, and the join shifts the whole timeline by that much.
    The position is measured from the finished file, not assumed.
 
+**What is lossless, and what is not.** Measured on a real merge (a 2 h 51 min
+local recording plus 1 min 51 s recovered from a Twitch VOD):
+
+* **Your recording — bit-identical.** Every one of its 618 330 video packets
+  and 483 070 audio packets was hashed in both files: the picture data and the
+  sound are byte for byte the same. The only bytes added are the codec's own
+  header (37 bytes: SPS/PPS) in front of each keyframe, once a second, so a
+  player can switch from the opening's encoder to yours. It carries no
+  picture.
+* **The recovered opening — as good as the VOD, never better.** Those frames
+  exist only in the VOD, which the platform already compressed (7.5 Mbit/s
+  here, against 15.8 for the local recording). The opening is re-encoded from
+  it at a very high quality (x264 CRF 10, 23 Mbit/s) to match your file's
+  format: against the VOD it measures 51.6 dB PSNR on average (47.5 dB on the
+  worst frame), SSIM 0.997 — differences well below what the eye can see, but
+  not zero. Its sound is re-encoded at the higher of the two sources' rates
+  (at least 192 kbit/s), so it is not squeezed a second time.
+* **Why not mathematically lossless?** A lossless H.264 encode needs a
+  different profile (High 4:4:4) from almost every recording's, and one file
+  mixing the two plays badly or not at all in many players and editors.
+  Copying the VOD's own frames instead only works up to its last keyframe
+  before the cut, and needs its timing and encoder settings to match yours.
+
 While it runs, **the output file's size will not change in Explorer.** Windows
 does not refresh size or mtime while ffmpeg holds the file open. Watch
 `merge_work\progress.txt` instead — the `out_time` line is the live position.
