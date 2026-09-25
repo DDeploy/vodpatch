@@ -398,6 +398,79 @@ function Test-X264() {
 function Get-VideoStream($info) { $info.streams | Where-Object { $_.codec_type -eq "video" } | Select-Object -First 1 }
 function Get-AudioStream($info) { $info.streams | Where-Object { $_.codec_type -eq "audio" } | Select-Object -First 1 }
 
+# CONSTRAINT 14 -- every piece of a stream-copy join must count time in the
+# SAME units (time base). The concat demuxer does not reconcile them: an
+# opening whose video counted in 1/15360 s (what x264 picks by default at an
+# integer 60 fps) joined to a master counting in 1/60000 s gave a file whose
+# video track claimed 40 691 s instead of 10 417 s - 60000/15360 = 3.906x too
+# long, playing in slow motion against the audio and unusable to scrub. At
+# 59.94 fps x264's default happens to be 1/60000, which is why a 59.94 master
+# never showed it. The opening is therefore encoded with the master's video
+# timescale (New-Opening), and Assert-SameClock checks it before any join.
+function Get-Timescale($stream) {
+    if (-not $stream -or -not $stream.time_base) { return 0 }
+    $p = ([string]$stream.time_base) -split '/'
+    $n = 0L; $d = 0L
+    if ($p.Count -eq 2 -and [long]::TryParse($p[0], [ref]$n) -and [long]::TryParse($p[1], [ref]$d) -and
+        $n -eq 1 -and $d -gt 0) { return $d }
+    return 0
+}
+
+function Assert-SameClock([string]$segPath, $masterInfo) {
+    $si = Probe $segPath
+    if (-not $si) { Log "ERROR: the recovered opening does not probe."; Finish 1 }
+    foreach ($kind in @("video", "audio")) {
+        $ms = $masterInfo.streams | Where-Object { $_.codec_type -eq $kind } | Select-Object -First 1
+        $ss = $si.streams         | Where-Object { $_.codec_type -eq $kind } | Select-Object -First 1
+        if ($ms -and $ss -and ([string]$ms.time_base -ne [string]$ss.time_base)) {
+            Log ("ERROR: the recovered opening's {0} counts time in units of {1} s, the master's in {2} s." -f $kind, $ss.time_base, $ms.time_base)
+            Log  "       Joined by stream copy, the result would have the wrong length and play"
+            Log  "       at the wrong speed (CONSTRAINT 14). The output was not written."
+            Log  "       Please report this, with the output of: vodpatch.bat doctor"
+            Finish 1
+        }
+    }
+    Log ("The opening and the master count time in the same units (video {0}, audio {1})." -f `
+         (Get-VideoStream $si).time_base, (Get-AudioStream $si).time_base)
+}
+
+# The finished file's length is CHECKED, not just printed: a join that broke
+# the timestamps (CONSTRAINT 14) used to report SUCCESS right next to
+# "Duration 40 691s (expected ~10 417s)". Each stream is compared with what its
+# two pieces add up to - the concat demuxer starts the master at the opening's
+# full length - so a master whose audio legitimately ends a little before its
+# video is not mistaken for a broken result. A wrong result is renamed, never
+# left looking finished.
+function Assert-FinalLength([string]$outFile, [string]$segPath, $masterInfo) {
+    $o  = Probe $outFile
+    $si = Probe $segPath
+    if (-not $o -or -not $si) { Log "ERROR: could not probe the result to check its length."; Finish 1 }
+    $head = [double]$si.format.duration
+    $bad = @()
+    foreach ($kind in @("video", "audio")) {
+        $ms = $masterInfo.streams | Where-Object { $_.codec_type -eq $kind } | Select-Object -First 1
+        $os = $o.streams          | Where-Object { $_.codec_type -eq $kind } | Select-Object -First 1
+        if (-not $ms -or -not $os -or -not $ms.duration -or -not $os.duration) { continue }
+        $want = $head + [double]$ms.duration
+        $got  = [double]$os.duration
+        $tol  = [Math]::Max(2.0, 0.001 * $want)
+        if ([Math]::Abs($got - $want) -gt $tol) { $bad += ("{0} {1}s instead of {2}s" -f $kind, (F2 $got), (F2 $want)) }
+    }
+    if ($bad.Count) {
+        $broken = Get-SiblingPath $outFile "broken"
+        Remove-Item -LiteralPath $broken -Force -ErrorAction SilentlyContinue
+        Move-Item -LiteralPath $outFile -Destination $broken -Force
+        Log ("ERROR: the result has the wrong length: " + ($bad -join ", ") + ".")
+        Log ("       It was renamed to {0}" -f $broken)
+        Log  "       so it cannot be mistaken for a good file - delete it. Your originals are"
+        Log  "       untouched. Please report this, with the output of: vodpatch.bat doctor"
+        Finish 1
+    }
+    Log ("SUCCESS -> {0}" -f $outFile)
+    Log ("Length {0}s, as expected (the opening's {1}s + the master's {2}s)." -f `
+         (F2 ([double]$o.format.duration)), (F2 $head), (F2 ([double]$masterInfo.format.duration)))
+}
+
 # Every video file in a folder, biggest first.
 function Get-VideoFiles([string]$dir) {
     if (-not $dir -or -not (Test-Path -LiteralPath $dir)) { return @() }
@@ -1426,9 +1499,22 @@ function Assert-SaneOffset([double]$offset, [double]$vodDur) {
 function New-Opening([double]$offset, $v, $a) {
     $seg  = Join-Path $WorkDir "opening.mp4"
     $part = Get-SiblingPath $seg "part"
+    $ts   = Get-Timescale $v                          # CONSTRAINT 14
 
-    $stamp = ("offset={0}|audioshift={1}|vod={2}|vodsize={3}" -f `
-              (F $offset), (F $AudioShift), $Vod, (FI (Get-Item -LiteralPath $Vod).Length))
+    # EXACTLY n frames, where offset = n / fps (the offset convention of the
+    # frame check). "-t offset" alone let one more frame in: the offset is
+    # printed to 6 decimals, 111.466667 > 6688/60, so the VOD frame at slot n -
+    # the one showing the master's very first picture - was encoded too. The
+    # cut then showed that moment twice and left a one-frame (16.7 ms) hole in
+    # the sound at the join.
+    $rp = ([string]$v.r_frame_rate) -split '/'
+    $nFrames = [long][Math]::Round($offset * [double]$rp[0] / [double]$rp[1])
+
+    # timescale=, frames= and streams= are in the stamp so that an opening
+    # cached by an older version (x264's own timescale, one frame too many, the
+    # VOD's data track and chapters) is rebuilt rather than reused.
+    $stamp = ("offset={0}|audioshift={1}|vod={2}|vodsize={3}|timescale={4}|frames={5}|streams=v,a" -f `
+              (F $offset), (F $AudioShift), $Vod, (FI (Get-Item -LiteralPath $Vod).Length), (FI $ts), (FI $nFrames))
 
     $reuse = $false
     if ((Test-Path -LiteralPath $seg) -and $Force) {
@@ -1465,8 +1551,29 @@ function New-Opening([double]$offset, $v, $a) {
         Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
         Log ("Encoding the recovered opening (VOD 0 - {0}s)..." -f (F $offset))
         $encArgs = Get-EncodeArgs $v $a
-        if (-not (FF (@("-y", "-hide_banner", "-loglevel", "warning") + $TsFix +
-                      @("-i", $Vod, "-t", (F $offset)) + $encArgs + @($part)) "opening encode")) {
+        # The streams are chosen explicitly: the VOD's video and sound, nothing
+        # else. Left to ffmpeg's defaults, a Twitch VOD also contributed its data
+        # track and its CHAPTERS - one "Special Events" chapter spanning the
+        # whole VOD, which in a trimmed clip becomes a track longer than the
+        # clip itself, and players size the timeline to it.
+        $inArgs  = @("-i", $Vod)
+        $mapArgs = @("-map", "0:v:0")
+        $vi = Probe $Vod
+        if ($vi -and (Get-AudioStream $vi)) {
+            $mapArgs += @("-map", "0:a:0")
+        } else {
+            # No sound track in the VOD: silence in the master's format, so the
+            # opening still has the master's streams (CONSTRAINT 5).
+            Log "  the VOD has no sound track - the recovered opening gets silence"
+            $cl = if ([int]$a.channels -eq 1) { "mono" } else { "stereo" }
+            $inArgs += @("-f", "lavfi", "-t", (F $offset), "-i", ("anullsrc=r={0}:cl={1}" -f (FI $a.sample_rate), $cl))
+            $mapArgs += @("-map", "1:a:0")
+        }
+        $mapArgs += @("-dn", "-sn", "-map_chapters", "-1")
+        $tsArgs = @()
+        if ($ts -gt 0) { $tsArgs = @("-video_track_timescale", (FI $ts)) }
+        if (-not (FF (@("-y", "-hide_banner", "-loglevel", "warning") + $TsFix + $inArgs +
+                      @("-t", (F $offset), "-frames:v", (FI $nFrames)) + $mapArgs + $encArgs + $tsArgs + @($part)) "opening encode")) {
             Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
             Log "ERROR: the opening encode failed. The partial file was deleted."
             Log "Your originals are untouched."
@@ -1590,7 +1697,10 @@ function Add-MasterStreamLayout($rawSeg, $masterInfo) {
     $call = @("-y", "-hide_banner", "-loglevel", "error",
               "-i", $rawSeg, "-t", "5", "-i", $Master,
               "-map", "0:v:0", "-map", ("1:" + (FI $didx)), "-map", "0:a:0",
-              "-c", "copy") + $winner.a + @($part)
+              "-c", "copy") + $winner.a
+    $tsm = Get-Timescale (Get-VideoStream $masterInfo)          # CONSTRAINT 14
+    if ($tsm -gt 0) { $call += @("-video_track_timescale", (FI $tsm)) }
+    $call += @($part)
     if (-not (FF $call "opening restructure")) {
         Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
         Log "ERROR: rebuilding the full opening failed. Your originals are untouched."
@@ -1656,9 +1766,21 @@ function Invoke-Preflight($listPath, [double]$offset, [double]$headBytes,
             $errA  = & $ffmpeg -hide_banner -v error -i $testOut -map 0:a:0 -f s16le -y NUL 2>&1 | Out-String
             $codeA = $LASTEXITCODE
             $errs  = ($errV.Trim() + "`n" + $errA.Trim()).Trim()
+            # The time reached must also be PLAUSIBLE, and video and audio must
+            # agree. A join that broke the timestamps (CONSTRAINT 14) "crossed
+            # the seam" easily - its video claimed 552.8 s after ~80 s of
+            # master - and passed; only the length told the truth.
+            $vs = Get-VideoStream $ti; $as = Get-AudioStream $ti
+            $vdur = if ($vs -and $vs.duration) { [double]$vs.duration } else { $tdur }
+            $adur = if ($as -and $as.duration) { [double]$as.duration } else { $tdur }
+            $maxPlausible = $offset + 1.5 * ($margin / $masterBytesPerSec) + 15
             if ($tdur -le ($offset + 2)) {
                 Log ("  FAIL - the test only reached {0:N1}s; it never crossed the seam at {1}s." -f $tdur, (F $offset))
                 Log  "         The join stopped early - read the ffmpeg lines above."
+            } elseif ([Math]::Abs($vdur - $adur) -gt 1.0 -or $tdur -gt $maxPlausible) {
+                Log ("  FAIL - the joined timeline is wrong: video {0}s, audio {1}s, but about {2}s" -f (F2 $vdur), (F2 $adur), (F2 ($offset + $margin / $masterBytesPerSec)))
+                Log  "         were written. Joined like this the result would have the wrong length and"
+                Log  "         play at the wrong speed (CONSTRAINT 14)."
             } elseif ($errs -or $codeV -ne 0 -or $codeA -ne 0) {
                 Log ("  FAIL on decode: " + (($errs -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 4) -join "  //  "))
             } else {
@@ -2177,6 +2299,25 @@ if ($Stage -eq "seamtest") {
         Log ("ERROR: the offset is only {0}s, so there is nothing to show before the cut." -f (F $offset))
         Finish 1
     }
+
+    # The VOD half is cut on the SAME frame grid the merge uses: the merge's
+    # opening is exactly nCut frames (offset = nCut / fps), so the clip shows
+    # the last nPre of them and then the master's frame 0. Seeking straight to
+    # "offset - pre" did not: a VOD frame can sit a few ms BEFORE its slot on
+    # that grid (4 ms on a real Twitch VOD), an input seek drops frames before
+    # the seek point, and the clip lost its first frame and showed its last one
+    # twice - a hitch at the cut that the real merge does not have. Seeking a
+    # whole frame earlier keeps the grid (a seek of N > 0 rebases timestamps by
+    # exactly N) and the trims below take exactly the frames the merge uses.
+    $rq     = ([string]$v.r_frame_rate) -split '/'
+    $fr     = [double]$rq[0] / [double]$rq[1]
+    $nCut   = [long][Math]::Round($offset * $fr)
+    $nPre   = [long][Math]::Round($pre * $fr)
+    if ($nPre -gt $nCut) { $nPre = $nCut }
+    $nSeek  = [Math]::Max(0L, $nCut - $nPre - 1)
+    $seekAt = $nSeek / $fr
+    $j0     = $nCut - $nPre - $nSeek                   # the first frame to show, counted from the seek point
+    $pre    = $nPre / $fr                              # whole frames, so video and sound end together
     $testOut = if ($Out) { $OutFile } else { Join-Path $ExportDir "seam_test.mp4" }
     $tDir = [System.IO.Path]::GetDirectoryName($testOut)
     if ($tDir -and -not (Test-Path -LiteralPath $tDir)) { New-Item -ItemType Directory -Force -Path $tDir | Out-Null }
@@ -2187,7 +2328,14 @@ if ($Stage -eq "seamtest") {
     Log ("The cut lands at exactly {0}s into the clip." -f (F2 $pre))
 
     $vw = FI $v.width; $vh = FI $v.height; $rate = $v.r_frame_rate
-    $fpre = F $pre; $fpost = F $post
+    $fpost = F $post
+    # Video and sound are cut at the same two instants: frames j0 .. j0+nPre-1
+    # and the sound under them. After the fps filter the trim filter rounds its
+    # bounds to whole frames (the link's time base is 1/fps), so the exact frame
+    # times are the right bounds - a bound half a frame early was rounded DOWN
+    # and dropped the last frame.
+    $aA = F ($j0 / $fr); $aB = F (($j0 + $nPre) / $fr)
+    $vA = $aA;           $vB = $aB
 
     # Each segment's video and audio are trimmed to exactly the same length.
     # That is not tidiness: the concat FILTER pads whichever of a segment's two
@@ -2200,19 +2348,38 @@ if ($Stage -eq "seamtest") {
     #
     # apad before atrim guarantees the audio can actually reach the trim point;
     # atrim alone would leave it short again.
-    $fc = "[0:v]scale=${vw}:${vh},fps=$rate,setsar=1,format=yuv420p,trim=0:${fpre},setpts=PTS-STARTPTS[v0];" +
+    $fc = "[0:v]scale=${vw}:${vh},fps=$rate,setsar=1,format=yuv420p,trim=start=${vA}:end=${vB},setpts=PTS-STARTPTS[v0];" +
           "[1:v]scale=${vw}:${vh},fps=$rate,setsar=1,format=yuv420p,trim=0:${fpost},setpts=PTS-STARTPTS[v1];" +
-          "[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,apad,atrim=0:${fpre},asetpts=PTS-STARTPTS[a0];" +
+          "[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,apad,atrim=start=${aA}:end=${aB},asetpts=PTS-STARTPTS[a0];" +
           "[1:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,apad,atrim=0:${fpost},asetpts=PTS-STARTPTS[a1];" +
           "[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]"
 
     $ok = FF (@("-y", "-hide_banner", "-loglevel", "error") + $TsFix +
-              @("-ss", (F ($offset - $pre)), "-t", (F $pre), "-i", $Vod,
+              @("-ss", (F $seekAt), "-t", (F (($j0 + $nPre + 2) / $fr)), "-i", $Vod,
                 "-ss", "0", "-t", (F $post), "-i", $Master,
                 "-filter_complex", $fc, "-map", "[v]", "-map", "[a]",
+                # No chapters or data tracks from the VOD: a Twitch VOD's single
+                # chapter spans the whole VOD and made this 10 s clip show an
+                # 85 s timeline in players.
+                "-map_chapters", "-1", "-dn", "-sn",
                 "-c:v", "libx264", "-crf", "20", "-preset", "veryfast",
                 "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
                 $testOut)) "seam test clip"
+
+    # The clip must be exactly as long as asked, in every track.
+    if ($ok -and (Test-Path -LiteralPath $testOut)) {
+        $ci = Probe $testOut
+        $want = $pre + $post
+        $longest = 0.0
+        if ($ci) {
+            $longest = [double]$ci.format.duration
+            foreach ($s in $ci.streams) { if ($s.duration -and [double]$s.duration -gt $longest) { $longest = [double]$s.duration } }
+        }
+        if (-not $ci -or $longest -gt $want + 0.5 -or $longest -lt $want - 0.5) {
+            Log ("ERROR: the test clip came out {0}s long instead of {1}s. Please report this." -f (F2 $longest), (F2 $want))
+            Finish 1
+        }
+    }
 
     if ($ok -and (Test-Path -LiteralPath $testOut)) {
         Log ("OK -> {0}  ({1:N0} MB)" -f $testOut, ((Get-Item $testOut).Length / 1MB))
@@ -2299,6 +2466,7 @@ if ($Stage -eq "merge") {
 
     # ---- 2. give the opening the master's stream layout ---------------------
     $segment = Add-MasterStreamLayout $rawSeg $masterInfo
+    Assert-SameClock $segment $masterInfo
 
     $list = Join-Path $WorkDir "concat_list.txt"
     Write-ConcatList $list $segment $Master
@@ -2313,10 +2481,7 @@ if ($Stage -eq "merge") {
 
     Log "Joining by stream copy - the master is copied byte for byte, never re-encoded."
     if (-not (Invoke-FinalJoin $list $OutFile "final join")) { Finish 1 }
-
-    $o = Probe $OutFile
-    Log ("SUCCESS -> {0}" -f $OutFile)
-    if ($o) { Log ("Duration {0:N1}s (expected ~{1:N1}s)" -f [double]$o.format.duration, ($offset + $masterDur)) }
+    Assert-FinalLength $OutFile $segment $masterInfo
 
     Log "Checking the seam for decode errors..."
     $global:LASTEXITCODE = 0
@@ -2419,6 +2584,9 @@ if ($Stage -eq "stripmerge") {
     Log ("  done: {0:N1} GB" -f ((Get-Item $stripped).Length / 1GB))
 
     # Step 2: both files are now video+audio only, so the indices line up.
+    $strippedInfo = Probe $stripped
+    if (-not $strippedInfo) { Log "ERROR: the timecode-free copy does not probe."; Finish 1 }
+    Assert-SameClock $rawSeg $strippedInfo
     $list = Join-Path $WorkDir "concat_list.txt"
     Write-ConcatList $list $rawSeg $stripped
 
@@ -2435,9 +2603,7 @@ if ($Stage -eq "stripmerge") {
         Finish 1
     }
 
-    $o = Probe $OutFile
-    Log ("SUCCESS -> {0}" -f $OutFile)
-    if ($o) { Log ("Duration {0:N1}s (expected ~{1:N1}s)" -f [double]$o.format.duration, ($offset + $masterDur)) }
+    Assert-FinalLength $OutFile $rawSeg $strippedInfo
     Log ("You can delete the intermediate copy {0} once you have checked the result." -f $stripped)
     Log "DONE."
     Finish 0

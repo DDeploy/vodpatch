@@ -235,8 +235,9 @@ powershell -File vodpatch.ps1 -Stage seamtest -Pre 150 -Post 150
 
 Renders a short clip centred on the cut, to `exported\seam_test.mp4`: 5 seconds of
 VOD, the cut, then 5 seconds of the master (`-Pre` / `-Post` show more, as in
-the second line above). Watch it. What you
-want to see at the join:
+the second line above). The VOD half is cut on the same frames the merge will
+use, so the clip shows the join exactly as the final file will. Watch it. What
+you want to see at the join:
 
 * the action flows straight through — no jump back, no skipped moment, no
   frozen frame;
@@ -258,15 +259,22 @@ was measured on a CFast card, against ~155 MB/s writing to an internal SSD.
 The merge:
 
 1. re-encodes the recovered opening from the VOD, matching the master's codec,
-   resolution, frame rate, pixel format, colour metadata and audio format;
+   resolution, frame rate, pixel format, colour metadata, audio format and
+   **clock** (time base) — exactly as many frames as the offset covers, and
+   only the VOD's picture and sound (no data tracks, no chapters);
 2. gives it the master's **stream layout** (see
-   [The timecode track](#the-timecode-track));
+   [The timecode track](#the-timecode-track)), and checks that both pieces
+   count time in the same units;
 3. runs a **preflight**: the real join command, stopped by bytes written, to
-   the real destination, asserting that it actually crossed the seam and
-   decodes cleanly;
+   the real destination, asserting that it actually crossed the seam, that its
+   picture and sound are the same length and plausible, and that it decodes
+   cleanly;
 4. joins the two by stream copy, writing to a `.part` file that is renamed only
    on success;
-5. verifies the seam and writes stills of it to `merge_work\verify\`.
+5. **checks the finished file's length** against the opening plus the master,
+   track by track. A result of the wrong length is renamed `*.broken.mp4` and
+   the merge fails — it is never reported as a success;
+6. verifies the seam and writes stills of it to `merge_work\verify\`.
 
 While it runs, **the output file's size will not change in Explorer.** Windows
 does not refresh size or mtime while ffmpeg holds the file open. Watch
@@ -481,6 +489,30 @@ The preflight's `[Math]::Max(150MB, …)` did exactly that for any master above
 about 215 MB/s (4K ProRes and similar): the margin came out empty, the test file
 stopped right at the seam, and every merge failed its preflight. It now reads
 `[Math]::Max([double]150MB, …)`. (CONSTRAINT 13.)
+
+### The merged file is hours too long, and stutters when you scrub it
+
+Every piece of a stream-copy join must count time in the **same units** (its
+*time base*). The concat demuxer does not reconcile them. x264 picks its own
+clock for the recovered opening — 1/15360 s at an integer 60 fps — while a
+60 fps OBS recording counts in 1/60000 s, and the joined file's video track then
+claimed **40 691 s instead of 10 417 s**: 60000 / 15360 = 3.906× too long,
+playing in slow motion against the sound. (At 59.94 fps x264's default happens
+to be 1/60000, which is why a 59.94 master never showed it.) The opening is now
+encoded with the master's clock (`-video_track_timescale`); the merge refuses
+to join pieces whose clocks differ; the preflight fails if picture and sound
+disagree; and a finished file of the wrong length is renamed `*.broken.mp4`
+instead of being reported as a success. If you merged with an older version,
+merge again — the cached opening is rebuilt automatically. (CONSTRAINT 14.)
+
+### The seam test is 10 seconds long but the player shows a much longer timeline
+
+A Twitch VOD carries a **chapter** spanning the whole VOD, and ffmpeg copies
+chapters by default. Cut out of the middle of the VOD, that chapter became a
+track running 85 s past a 10 s clip, and players size the timeline to the
+longest track. The seam test and the recovered opening now take only the VOD's
+picture and sound (`-map_chapters -1 -dn`), and the seam test checks its own
+length.
 
 ## Known limitations
 
