@@ -121,7 +121,7 @@ anything — whether the destination has room:
   Output   D:\exported\full_recording.mp4
            27.7 GB free - NOT ENOUGH, needs about 56.3 GB
 
-  [1] Analyze        offset 170.353517 s - confirmed by picture and sound
+  [1] Analyze        cut at 00:02:50.354 in the VOD - confirmed by picture and sound
   [2] Seam test      seam_test.mp4, 12 min ago
   [3] Merge          blocked: not enough space at the destination
   [4] Merge - fallback route (strip the timecode track)
@@ -170,13 +170,24 @@ Step 1/3 - sound: the loudness of the master's first 90 s, searched through the 
 Step 2/3 - pictures: every VOD keyframe against the master's first 60 s...
   picture match 1: VOD 111.40s  distance 0.98/255 over 30 keyframes
   picture match 2: VOD 131.30s  distance 27.35/255 over 31 keyframes
-Step 3/3 - frame check: each candidate, frame by frame, at 3 distinctive moments...
+Step 3/3 - frame check: each candidate, frame by frame, at up to 3 distinctive moments...
   111.50s (sound+picture): 23.00s -> 6688 (0.31);  39.00s -> 6688 (0.29);  34.00s -> 6688 (0.28)  => MATCH, frame 6688
   166.20s (sound): 23.00s -> 10029 (44.28) no;  ...  => no match
 RESULT: CONFIRMED. The picture matches frame for frame at separate moments,
         and the sound independently lands 0.03s away.
-OFFSET: 111.466667 s  = 6688 frames at 60/1 fps = 1 min 51.47 s of recovered footage
+OFFSET: 111.466667 s  = 6688 frames at 60/1 fps = 00:01:51.467 of recovered footage
+==============================================================
+  THE CUT IS AT  00:01:51.467  into the VOD
+  Your local recording begins at this moment of the VOD. In the merged file
+  the VOD part ends here and your recording takes over (the merge prints the
+  exact position in the finished file).
+==============================================================
 ```
+
+Every time the tool talks about the cut it gives it the way a video player
+shows a position — **HH:MM:SS.mmm** — so you can jump straight to it: the
+analysis says where it is in the VOD, the seam test where it is in the clip,
+and the merge where it is in the finished file.
 
 How it works. Two cheap searches each **suggest** up to three candidate
 offsets; neither decides anything on its own:
@@ -274,7 +285,12 @@ The merge:
 5. **checks the finished file's length** against the opening plus the master,
    track by track. A result of the wrong length is renamed `*.broken.mp4` and
    the merge fails — it is never reported as a success;
-6. verifies the seam and writes stills of it to `merge_work\verify\`.
+6. verifies the seam and writes stills of it to `merge_work\verify\`;
+7. prints **where the cut is in the finished file**, e.g.
+   `THE CUT IS AT 00:01:51.488 in full_recording.mp4`. That is usually a frame
+   or so after the offset: the recovered opening's sound starts with ~21 ms of
+   AAC encoder priming, and the join shifts the whole timeline by that much.
+   The position is measured from the finished file, not assumed.
 
 While it runs, **the output file's size will not change in Explorer.** Windows
 does not refresh size or mtime while ffmpeg holds the file open. Watch
@@ -312,7 +328,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\vodpatch.ps1 `
 | `-Strip`       | next to `-Out`              | `stripmerge`'s timecode-free copy of the master      |
 | `-Pre` `-Post` | `5` `5`                     | `seamtest`: seconds shown each side of the cut       |
 | `-AudioShift`  | `0`                         | shift the opening's audio against its video, in seconds. Positive delays the audio, negative advances it. Applied to the recovered opening only. |
-| `-Offset`      | from `sync_result.txt`      | use this offset instead of the analysis's. Typing it is you taking responsibility: the merge then starts even on an unconfirmed verdict. |
+| `-Offset`      | from `sync_result.txt`      | use this offset instead of the analysis's, in seconds (`111.466667`) or as the time the analysis prints (`00:01:51.467`). Typing it is you taking responsibility: the merge then starts even on an unconfirmed verdict. |
 | `-Force`       | off                         | rebuild the cached opening even if it looks reusable |
 
 Numbers can be written with a point **or a comma** — `12.5` and `12,5` both
@@ -463,8 +479,9 @@ separator. Measured: `-AudioShift -0,25` became −25, `-Offset 12,5` became 125
 every sanity check and silently builds the wrong file.
 
 So `-Offset`, `-AudioShift`, `-Pre` and `-Post` are read as **text** and parsed
-by `ConvertTo-Seconds`, which accepts a point or a comma and refuses anything
-else. The menu's prompts go through it too — `"12,5" -as [double]` is also 125.
+by `ConvertTo-Seconds`, which accepts a point or a comma — or a time as the
+tool prints it, `HH:MM:SS.mmm` — and refuses anything else. The menu's prompts
+go through it too — `"12,5" -as [double]` is also 125.
 (CONSTRAINT 11.) The variables behind them are deliberately not called
 `$Offset` etc.: PowerShell names are case-insensitive, so a stage's
 `$offset = Read-Offset` would write straight into the parameter.

@@ -207,6 +207,23 @@ function Log([string]$msg) {
     Write-Host $line
 }
 
+# The same, in colour on the console - for the few lines nobody may miss,
+# above all where the cut is.
+function Log-Highlight([string]$msg, [string]$color = "Green") {
+    $line = "[{0}] {1}" -f (Get-Date -Format "HH:mm:ss"), $msg
+    try { [System.IO.File]::AppendAllText($Log, $line + [Environment]::NewLine, $Utf8NoBom) } catch { }
+    Write-Host $line -ForegroundColor $color
+}
+
+# Where the cut is, as a clearly marked block. $where says which file the time
+# refers to; $lines explain what happens there.
+function Write-CutBanner([double]$seconds, [string]$where, [string[]]$lines, [string]$color = "Green") {
+    Log-Highlight ("=" * 62) $color
+    Log-Highlight ("  THE CUT IS AT  {0}  {1}" -f (Format-Clock $seconds), $where) $color
+    foreach ($l in $lines) { Log-Highlight ("  " + $l) $color }
+    Log-Highlight ("=" * 62) $color
+}
+
 Log ("=" * 70)
 Log ("{0} -- stage '{1}'" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Stage)
 if ($WorkDirFallback) {
@@ -241,20 +258,53 @@ function F3($x) {
     return $d.ToString("0.000", [System.Globalization.CultureInfo]::InvariantCulture)
 }
 
+# A time the way a video player shows it: HH:MM:SS.mmm (00:01:51.467). Built
+# from whole milliseconds, so it never depends on the culture (CONSTRAINT 2)
+# and 59.9996 s reads 00:01:00.000, not 00:00:60.000.
+function Format-Clock($x) {
+    $d = [double]$x
+    if ([double]::IsNaN($d) -or [double]::IsInfinity($d)) { return "n/a" }
+    $sign = ""
+    if ($d -lt 0) { $sign = "-"; $d = -$d }
+    $ms = [long][Math]::Round($d * 1000.0)
+    $h  = [long][Math]::Floor($ms / 3600000.0); $ms -= $h * 3600000
+    $m  = [long][Math]::Floor($ms / 60000.0);   $ms -= $m * 60000
+    $s  = [long][Math]::Floor($ms / 1000.0);    $ms -= $s * 1000
+    return ($sign + $h.ToString("00") + ":" + $m.ToString("00") + ":" + $s.ToString("00") + "." + $ms.ToString("000"))
+}
+
 # CONSTRAINT 11 (continued) -- parse a number of seconds typed by a human.
 # Accepts "111.467" and "111,467" alike, and nothing else: no thousands
 # separators, no exponents, no spaces inside. Returns $null when it is not a
 # plain number, so the caller can say so instead of guessing.
+#
+# Also accepts a time the way this tool prints the cut - HH:MM:SS.mmm or
+# MM:SS.mmm (00:01:51.467, 1:51.467) - so a time copied from the log can be
+# typed back. Its milliseconds never move the cut by a frame: the merge and
+# the seam test round the offset to whole frames, half a frame is 8 ms even at
+# 60 fps, and the printed time is within 0.5 ms. Each field below the first
+# must be under 60.
 function ConvertTo-Seconds([string]$s, [switch]$AllowNegative) {
     if ($null -eq $s) { return $null }
     $t = $s.Trim()
+    $styles = [System.Globalization.NumberStyles]::AllowDecimalPoint -bor
+              [System.Globalization.NumberStyles]::AllowLeadingSign
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    if ($t -match '^(-?)(?:([0-9]+):)?([0-9]+):([0-9]{1,2}(?:[.,][0-9]+)?)$') {
+        if ($Matches[1] -and -not $AllowNegative) { return $null }
+        $hh = 0L; $mm = 0L; $ss = 0.0
+        if ($Matches[2]) { $hh = [long]$Matches[2] }
+        $mm = [long]$Matches[3]
+        if (-not [double]::TryParse($Matches[4].Replace(',', '.'), $styles, $inv, [ref]$ss)) { return $null }
+        if ($ss -ge 60 -or ($Matches[2] -and $mm -ge 60)) { return $null }
+        $total = $hh * 3600.0 + $mm * 60.0 + $ss
+        if ($Matches[1]) { $total = -$total }
+        return $total
+    }
     $pattern = if ($AllowNegative) { '^-?[0-9]+([.,][0-9]+)?$' } else { '^[0-9]+([.,][0-9]+)?$' }
     if ($t -notmatch $pattern) { return $null }
     $x = 0.0
-    $styles = [System.Globalization.NumberStyles]::AllowDecimalPoint -bor
-              [System.Globalization.NumberStyles]::AllowLeadingSign
-    if (-not [double]::TryParse($t.Replace(',', '.'), $styles,
-                                [System.Globalization.CultureInfo]::InvariantCulture, [ref]$x)) { return $null }
+    if (-not [double]::TryParse($t.Replace(',', '.'), $styles, $inv, [ref]$x)) { return $null }
     return $x
 }
 
@@ -265,7 +315,7 @@ function Get-NumberParam([string]$text, [double]$default, [string]$name, [switch
         # No "or 12,5" here: this only fails with a comma when the script is called
         # from a PowerShell prompt, where 12,5 is parsed as a LIST before it arrives.
         # From vodpatch.bat, cmd.exe or the menu, a comma works.
-        Log ("ERROR: -{0} '{1}' is not a number of seconds. Write it like 12.5" -f $name, $text)
+        Log ("ERROR: -{0} '{1}' is not a number of seconds. Write it like 12.5 (or as a time, 00:00:12.500)" -f $name, $text)
         Finish 1
     }
     return $v
@@ -467,8 +517,41 @@ function Assert-FinalLength([string]$outFile, [string]$segPath, $masterInfo) {
         Finish 1
     }
     Log ("SUCCESS -> {0}" -f $outFile)
-    Log ("Length {0}s, as expected (the opening's {1}s + the master's {2}s)." -f `
-         (F2 ([double]$o.format.duration)), (F2 $head), (F2 ([double]$masterInfo.format.duration)))
+    Log ("Length {0} = {1}s, as expected (the opening's {2}s + the master's {3}s)." -f `
+         (Format-Clock ([double]$o.format.duration)), (F2 ([double]$o.format.duration)), (F2 $head), (F2 ([double]$masterInfo.format.duration)))
+}
+
+# Where the join actually is in the finished file, as a player shows it -
+# MEASURED, not computed. The opening has exactly n frames, so the (n+1)-th
+# frame of the file in display order is the master's first; its timestamp is
+# the cut. Computing it instead goes wrong in small ways: the join shifts the
+# whole timeline by the opening's AAC priming (~21 ms, so the cut sits about a
+# frame after the offset: 00:01:51.488 for 111.466667 s), and a master whose
+# own sound starts earlier or later than its picture moves it again. Only the
+# packet index is read - no decoding - so this is instant even for hours.
+function Write-CutPosition([string]$outFile, [string]$segPath) {
+    $si = Probe $segPath
+    $ss = $null
+    if ($si) { $ss = Get-VideoStream $si }
+    if (-not $ss -or -not $ss.nb_frames) { return }
+    $n = [long]$ss.nb_frames
+    $global:LASTEXITCODE = 0
+    $raw = & $ffprobe -v error -select_streams v:0 -show_entries packet=pts_time `
+                      -read_intervals ("%+" + (F ([double]$si.format.duration + 5.0))) -of csv=p=0 $outFile 2>$null
+    $pts = New-Object System.Collections.Generic.List[double]
+    foreach ($l in @($raw)) {
+        $x = 0.0
+        if ([double]::TryParse(([string]$l).Split(',')[0].Trim(), [System.Globalization.NumberStyles]::Float,
+                               [System.Globalization.CultureInfo]::InvariantCulture, [ref]$x)) { $pts.Add($x) }
+    }
+    if ($pts.Count -le $n) {
+        Log "  (could not read the finished file's frame times to show where the cut is)"
+        return
+    }
+    $arr = $pts.ToArray()
+    $idx = [Sig]::Order($arr, $false)                   # CONSTRAINT 12: never [Array]::Sort
+    Write-CutBanner $arr[$idx[$n]] ("in " + [System.IO.Path]::GetFileName($outFile)) @(
+        "Before it: the opening recovered from the VOD. From there on: your recording.")
 }
 
 # Every video file in a folder, biggest first.
@@ -1375,10 +1458,10 @@ function Read-Offset() {
     if ($OffsetText) {
         $o = ConvertTo-Seconds $OffsetText                             # CONSTRAINT 11
         if ($null -eq $o) {
-            Log ("ERROR: -Offset '{0}' is not a number of seconds. Write it like 111.466667" -f $OffsetText)
+            Log ("ERROR: -Offset '{0}' is not a number of seconds. Write it like 111.466667, or as the time the analysis prints, 00:01:51.467" -f $OffsetText)
             Finish 1
         }
-        Log ("Using the offset given on the command line: {0}s" -f (F $o))
+        Log ("Using the offset given on the command line: {0}s = {1} into the VOD" -f (F $o), (Format-Clock $o))
         return $o
     }
     # The printed command carries the files and work folder in use: a bare
@@ -1417,7 +1500,7 @@ function Read-Offset() {
         Log ("ERROR: could not read the offset '{0}' from {1}." -f $cfg["offset"], $SyncFile)
         Finish 1
     }
-    Log ("Using offset {0}s (from the analysis: {1})" -f (F $o), (Get-StatusText $est))
+    Log ("Using offset {0}s = {1} into the VOD (from the analysis: {2})" -f (F $o), (Format-Clock $o), (Get-StatusText $est))
     return $o
 }
 
@@ -2104,12 +2187,12 @@ if ($Stage -eq "analyze") {
                 Log  "          at the VOD's very start - the master starts first, so nothing is missing"
             }
             foreach ($k in $clusters) {
-                Log ("          {0}s  (frame {1}, frame check {2}/255)" -f (F ($k.slot / $fps)), $k.slot, (F2 $k.worst))
+                Log ("          {0}  = {1}s  (frame {2}, frame check {3}/255)" -f (Format-Clock ($k.slot / $fps)), (F ($k.slot / $fps)), $k.slot, (F2 $k.worst))
                 $tests += ($k.slot / $fps)
             }
             if ($clusters.Count) {
                 foreach ($sg in $singleElsewhere) {
-                    Log ("          {0}s  (frame {1}, {2}/255 - at one moment only)" -f (F ($sg.slot / $fps)), $sg.slot, (F2 $sg.worst))
+                    Log ("          {0}  = {1}s  (frame {2}, {3}/255 - at one moment only)" -f (Format-Clock ($sg.slot / $fps)), (F ($sg.slot / $fps)), $sg.slot, (F2 $sg.worst))
                     $tests += ($sg.slot / $fps)
                 }
             }
@@ -2188,8 +2271,12 @@ if ($Stage -eq "analyze") {
     $tests = @($tests | Where-Object { $_ -ge $MinOffset })
 
     if ($mergeOk) {
-        Log ("OFFSET: {0} s  = {1} frames at {2} fps = {3} min {4} s of recovered footage" -f `
-             (F $offsetOut), $best.slot, $v.r_frame_rate, [Math]::Floor($offsetOut / 60), (F2 ($offsetOut % 60)))
+        Log ("OFFSET: {0} s  = {1} frames at {2} fps = {3} of recovered footage" -f `
+             (F $offsetOut), $best.slot, $v.r_frame_rate, (Format-Clock $offsetOut))
+        Write-CutBanner $offsetOut "into the VOD" @(
+            "Your local recording begins at this moment of the VOD. In the merged file",
+            "the VOD part ends here and your recording takes over (the merge prints the",
+            "exact position in the finished file).")
         Log "Next: in the menu, [2] to watch the join, then [3] to merge. From a console:"
         Log ("  " + (Get-StageCommand "seamtest" $null @()))
         Log ("  " + (Get-StageCommand "merge" $null @()))
@@ -2197,7 +2284,10 @@ if ($Stage -eq "analyze") {
     } elseif ($tests.Count) {
         Log "The merge will NOT start on this result. Watch each candidate's join with the"
         Log "seam test (about 10 s each):"
-        foreach ($o in $tests) { Log ("  " + (Get-StageCommand "seamtest" $o @())) }
+        foreach ($o in $tests) {
+            Log-Highlight ("  CANDIDATE cut at {0} into the VOD ({1}s) - not confirmed:" -f (Format-Clock $o), (F $o)) "Yellow"
+            Log ("    " + (Get-StageCommand "seamtest" $o @()))
+        }
         Log "then merge with the offset whose join you saw is clean, typed in place of SECONDS:"
         Log ("  " + (Get-StageCommand "merge" "SECONDS" @()))
         Log "  (menu: [2] asks which offset to test, [3] asks which offset to merge)"
@@ -2325,7 +2415,26 @@ if ($Stage -eq "seamtest") {
     # Invariant display: these numbers get typed back in (CONSTRAINT 11).
     Log ("Offset in use: {0}s" -f (F $offset))
     Log ("Building a {0}s clip: {1}s of VOD, then the cut, then {2}s of the master." -f (F2 ($pre + $post)), (F2 $pre), (F2 $post))
-    Log ("The cut lands at exactly {0}s into the clip." -f (F2 $pre))
+    # Green "THE CUT" only for the offset the analysis CONFIRMED. Every
+    # candidate's seam-test command carries -Offset, and a green banner saying
+    # "where your local recording begins" would dress a wrong candidate up as
+    # the answer.
+    $cutConfirmed = $false
+    if (Test-Path -LiteralPath $SyncFile) {
+        $cfgS = Read-SyncFile
+        $stS  = Get-EffectiveStatus $cfgS
+        $savedO = ConvertTo-Seconds ([string]$cfgS["offset"])
+        if (($stS -eq "confirmed" -or $stS -eq "video_only") -and $null -ne $savedO -and
+            [Math]::Abs($savedO - $offset) -lt (0.5 / $fr)) { $cutConfirmed = $true }
+    }
+    if ($cutConfirmed) {
+        Write-CutBanner $pre "into the clip" @(
+            ("= {0} into the VOD, where your local recording begins." -f (Format-Clock $offset)))
+    } else {
+        Write-CutBanner $pre "into the clip - a CANDIDATE, not confirmed" @(
+            ("= {0} into the VOD. The analysis did not confirm this cut: watch the" -f (Format-Clock $offset)),
+            "join, and merge with this offset only if it is clean.") "Yellow"
+    }
 
     $vw = FI $v.width; $vh = FI $v.height; $rate = $v.r_frame_rate
     $fpost = F $post
@@ -2384,7 +2493,7 @@ if ($Stage -eq "seamtest") {
     if ($ok -and (Test-Path -LiteralPath $testOut)) {
         Log ("OK -> {0}  ({1:N0} MB)" -f $testOut, ((Get-Item $testOut).Length / 1MB))
         Log ""
-        Log ("WHAT TO LOOK FOR, at {0}s into the clip:" -f (F2 $pre))
+        Log ("WHAT TO LOOK FOR, at {0} into the clip:" -f (Format-Clock $pre))
         Log  "  - the action should flow straight through, with no jump back,"
         Log  "    no skipped moment and no frozen frame"
         Log  "  - the picture will visibly sharpen at the cut: that is normal,"
@@ -2482,6 +2591,7 @@ if ($Stage -eq "merge") {
     Log "Joining by stream copy - the master is copied byte for byte, never re-encoded."
     if (-not (Invoke-FinalJoin $list $OutFile "final join")) { Finish 1 }
     Assert-FinalLength $OutFile $segment $masterInfo
+    Write-CutPosition $OutFile $segment
 
     Log "Checking the seam for decode errors..."
     $global:LASTEXITCODE = 0
@@ -2604,6 +2714,7 @@ if ($Stage -eq "stripmerge") {
     }
 
     Assert-FinalLength $OutFile $rawSeg $strippedInfo
+    Write-CutPosition $OutFile $rawSeg
     Log ("You can delete the intermediate copy {0} once you have checked the result." -f $stripped)
     Log "DONE."
     Finish 0
@@ -2776,7 +2887,7 @@ if ($Stage -eq "menu") {
             if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
             $o = ConvertTo-Seconds $raw                                # CONSTRAINT 11
             if ($null -eq $o) {
-                Write-Host ("  '{0}' is not a positive number of seconds - try again, or press Enter." -f $raw) -ForegroundColor Red
+                Write-Host ("  '{0}' is not a time - type seconds (111.466667) or HH:MM:SS (00:01:51.467), or press Enter." -f $raw) -ForegroundColor Red
                 continue
             }
             if ($o -lt $min) {
@@ -2911,8 +3022,8 @@ if ($Stage -eq "menu") {
             Write-Host "not run" -ForegroundColor Yellow
         } else {
             switch ($st.status) {
-                "confirmed"  { Write-Host ("offset {0} s - confirmed by picture and sound" -f (F $st.offset)) -ForegroundColor Green }
-                "video_only" { Write-Host ("offset {0} s - confirmed by picture" -f (F $st.offset)) -ForegroundColor Green }
+                "confirmed"  { Write-Host ("cut at {0} in the VOD - confirmed by picture and sound" -f (Format-Clock $st.offset)) -ForegroundColor Green }
+                "video_only" { Write-Host ("cut at {0} in the VOD - confirmed by picture" -f (Format-Clock $st.offset)) -ForegroundColor Green }
                 "conflict"   { Write-Host "NOT CONFIRMED: picture and sound disagree - see analyze_log.txt" -ForegroundColor Yellow }
                 "ambiguous"  { Write-Host "NOT CONFIRMED: matches in more than one place - see analyze_log.txt" -ForegroundColor Yellow }
                 "unverified" {
