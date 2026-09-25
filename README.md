@@ -121,7 +121,7 @@ anything — whether the destination has room:
   Output   D:\exported\full_recording.mp4
            27.7 GB free - NOT ENOUGH, needs about 56.3 GB
 
-  [1] Analyze        offset 170.353 s, methods agree
+  [1] Analyze        offset 170.353517 s - confirmed by picture and sound
   [2] Seam test      seam_test.mp4, 12 min ago
   [3] Merge          blocked: not enough space at the destination
   [4] Merge - fallback route (strip the timecode track)
@@ -161,38 +161,68 @@ vodpatch.bat analyze
 powershell -File vodpatch.ps1 -Stage analyze -Vod "D:\vod.mp4" -Master "D:\master.mp4"
 ```
 
-It reports something like:
+It reports something like this (a real run on a near-static interview):
 
 ```
-VIDEO coarse match: VOD t=170,35s  (corr=0,799, next-best elsewhere=0,322)
-VIDEO fine match: master t=15,02s = VOD t=185,368s
-  mean pixel difference at the best match: 0,6 / 255
-AUDIO match: VOD t=170,40s  (corr=0,856, next-best elsewhere=0,160)
-CHOSEN OFFSET: 170,353s of the VOD goes in front of the master
-  audio independently says 170,40s -> they differ by 0,05s (2,8 frames)
-  => both methods AGREE. High confidence.
+Step 1/3 - sound: the loudness of the master's first 90 s, searched through the whole VOD...
+  sound match 1: VOD 111.50s  r=0.831  z=13.23   <- strong
+  sound match 2: VOD 166.20s  r=0.202  z=3.25
+Step 2/3 - pictures: every VOD keyframe against the master's first 60 s...
+  picture match 1: VOD 111.40s  distance 0.98/255 over 30 keyframes
+  picture match 2: VOD 131.30s  distance 27.35/255 over 31 keyframes
+Step 3/3 - frame check: each candidate, frame by frame, at 3 distinctive moments...
+  111.50s (sound+picture): 23.00s -> 6688 (0.31);  39.00s -> 6688 (0.29);  34.00s -> 6688 (0.28)  => MATCH, frame 6688
+  166.20s (sound): 23.00s -> 10029 (44.28) no;  ...  => no match
+RESULT: CONFIRMED. The picture matches frame for frame at separate moments,
+        and the sound independently lands 0.03s away.
+OFFSET: 111.466667 s  = 6688 frames at 60/1 fps = 1 min 51.47 s of recovered footage
 ```
 
-Three independent things are computed:
+How it works. Two cheap searches each **suggest** up to three candidate
+offsets; neither decides anything on its own:
 
-1. **Coarse pass** — cross-correlates per-frame motion energy (ffmpeg `scdet`
-   scene scores) resampled onto a 100 Hz grid. Static differences between the
-   two sources — overlays, branding, grading — cancel out, leaving only the
-   shared motion.
-2. **Fine pass** — direct pixel matching on raw 64×36 greyscale frames at full
-   frame rate, anchored on the busiest moment in the first 30 s so that a black
-   or static opening frame cannot throw it off. It is only adopted if the mean
-   pixel difference is convincing and the winning position is not pinned to the
-   edge of the search window.
-3. **Audio cross-check** — an independent cross-correlation of the normalised
-   RMS loudness envelope. It has no influence on the answer; it exists to
-   disagree with the video when something is wrong.
+1. **Sound** — the loudness of the master's opening, correlated along the whole
+   VOD. It is about a hundred times cheaper than reading pictures, and it copes
+   with a VOD that ends shortly after the master starts.
+2. **Pictures** — every VOD keyframe compared with the master's opening. Only
+   keyframes are decoded, which is what keeps a six-hour VOD down to minutes.
+
+Then every candidate goes through a **frame check**: at three moments of the
+master that look different from what surrounds them, the master's picture is
+slid over the VOD frame by frame. A candidate is accepted only if at least two
+of those moments land on **the same frame**. A wrong candidate cannot do that —
+across 78 wrong candidates in testing, not one managed it. A moment that barely
+changes (a still "starting soon" screen) is never used: it would match every
+frame of that still equally well, so it proves nothing.
 
 The heavy inner loops are inline C# compiled with `Add-Type`, because
 PowerShell loops are far too slow for this.
 
-It also writes side-by-side verification stills to `merge_work\verify\`.
-**Look at them.** Left is the VOD, right is the master, at the same instant.
+**The verdict** is one of:
+
+| status | meaning | merge |
+|---|---|---|
+| `confirmed` | the picture matches frame for frame, and the sound agrees | starts |
+| `video_only` | the picture matches frame for frame; the sound could not help (silent, muted, different) | starts |
+| `conflict` | the picture matches, but the sound points somewhere else | blocked |
+| `ambiguous` | the picture matches in more than one place (a replay, a loop), or both at the VOD's very start and somewhere later, or a confirmed place is contradicted by a close match at one moment elsewhere | blocked |
+| `unverified` | the picture matches, but only one moment could be checked: the VOD ends too soon after the master starts, or the master's first minute has only one moment that changes enough to pin down a frame | blocked |
+| `audio_only` | only the sound matched; the picture could not confirm it | blocked |
+| `nothing_missing` | the master already starts at (or before) the VOD's first frame, give or take 0.1 s: there is no opening to recover | nothing to merge |
+| `none` | no match. If both searches ran, the files probably do not overlap; if one could not run (no audio, too few keyframes, too short, a master that opens on a still picture for a whole minute), the log says so and it proves nothing | nothing to merge |
+
+A result saved for **other files**, or by an **older version** of vodpatch, is
+treated as unconfirmed everywhere — in the menu, in the seam test's warning, and
+at the merge — until the analysis is run again.
+
+When it is not confirmed, the tool does **not** guess. It prints the exact
+seam-test command for each candidate, so you can watch each join in about 10
+seconds and then merge with the one you saw is clean, by typing it (`-Offset`,
+or when the menu asks). The seam test itself is never blocked — it is how you
+decide.
+
+It also writes verification stills to `merge_work\verify\`: VOD, master, and
+their difference, where **black means the same picture**. Look at them.
 
 The result is saved to `merge_work\sync_result.txt`.
 
@@ -203,7 +233,9 @@ vodpatch.bat seamtest
 powershell -File vodpatch.ps1 -Stage seamtest -Pre 150 -Post 150
 ```
 
-Renders a short clip centred on the cut, to `exported\seam_test.mp4`. Watch it. What you
+Renders a short clip centred on the cut, to `exported\seam_test.mp4`: 5 seconds of
+VOD, the cut, then 5 seconds of the master (`-Pre` / `-Post` show more, as in
+the second line above). Watch it. What you
 want to see at the join:
 
 * the action flows straight through — no jump back, no skipped moment, no
@@ -270,10 +302,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\vodpatch.ps1 `
 | `-Out`         | `<Root>\exported\full_recording.mp4` | the final file                              |
 | `-Work`        | `<Root>\merge_work`         | scratch folder                                       |
 | `-Strip`       | next to `-Out`              | `stripmerge`'s timecode-free copy of the master      |
-| `-Pre` `-Post` | `90` `90`                   | `seamtest`: seconds shown each side of the cut       |
+| `-Pre` `-Post` | `5` `5`                     | `seamtest`: seconds shown each side of the cut       |
 | `-AudioShift`  | `0`                         | shift the opening's audio against its video, in seconds. Positive delays the audio, negative advances it. Applied to the recovered opening only. |
-| `-Offset`      | from `sync_result.txt`      | skip the analysis and use this offset                |
+| `-Offset`      | from `sync_result.txt`      | use this offset instead of the analysis's. Typing it is you taking responsibility: the merge then starts even on an unconfirmed verdict. |
 | `-Force`       | off                         | rebuild the cached opening even if it looks reusable |
+
+Numbers can be written with a point **or a comma** — `12.5` and `12,5` both
+mean twelve and a half seconds — through `vodpatch.bat`, `cmd.exe` or the menu.
+From a PowerShell prompt use a point: there, `12,5` is a list before the script
+ever sees it. Anything else (`1e2`, `1,234.5`) is refused rather than guessed at.
 
 Relative paths are resolved against the directory you launched from, not
 against the work folder.
@@ -409,12 +446,54 @@ informative message is always first; the tail is generic "task finished with
 error code" noise. The `FF` wrapper logs the first six lines and then the last
 three.
 
+### An offset, audio shift or clip length comes out ten or a hundred times too big
+
+On a French (or any comma-decimal) Windows, PowerShell reads a `[double]`
+parameter with the *invariant* culture, where a comma is a **thousands**
+separator. Measured: `-AudioShift -0,25` became −25, `-Offset 12,5` became 125,
+`-Offset 111,467` became 111467. The 125 case is the dangerous one — it passes
+every sanity check and silently builds the wrong file.
+
+So `-Offset`, `-AudioShift`, `-Pre` and `-Post` are read as **text** and parsed
+by `ConvertTo-Seconds`, which accepts a point or a comma and refuses anything
+else. The menu's prompts go through it too — `"12,5" -as [double]` is also 125.
+(CONSTRAINT 11.) The variables behind them are deliberately not called
+`$Offset` etc.: PowerShell names are case-insensitive, so a stage's
+`$offset = Read-Offset` would write straight into the parameter.
+
+### The analysis takes minutes instead of seconds
+
+A `byte[]` returned bare from a PowerShell function is **unrolled** into an
+`object[]` of boxed bytes, and every C# call then converts it back — measured
+133 s instead of 0.1 s on the master's 8 MB of frames. `Get-RawFrames` returns
+`,$bytes` (note the comma) for this reason. The same copy-on-call behaviour
+makes `[Array]::Sort(keys, items)` silently sort a copy, which is why sorting
+goes through `[Sig]::Order`. (CONSTRAINT 12.)
+
+### A number is silently rounded — or every high-bitrate merge fails preflight
+
+`[Math]::Max(0, 134.458)` is **134**: with an integer first argument PowerShell
+picks the `Int32` overload. Always write `[Math]::Max(0.0, $x)`. The old
+detector had this bug in the seek that positioned its search window.
+
+The same overload **throws** once the other argument no longer fits in 32 bits.
+The preflight's `[Math]::Max(150MB, …)` did exactly that for any master above
+about 215 MB/s (4K ProRes and similar): the margin came out empty, the test file
+stopped right at the seam, and every merge failed its preflight. It now reads
+`[Math]::Max([double]150MB, …)`. (CONSTRAINT 13.)
+
 ## Known limitations
 
-* **Only tested against one master codec combination** — H.264 + `pcm_s24le` in
-  MP4, 1920×1080 @ 59.94, `yuv420p`, plus a `tmcd` timecode track. Other
-  combinations should work (profile and audio-encoder names are mapped) but are
-  untested.
+* **Only tested against two real master / VOD combinations** — H.264 +
+  `pcm_s24le` in MP4 at 1920×1080 59.94 with a `tmcd` timecode track, and H.264
+  + AAC in MP4 at 1920×1080 60 with no timecode — plus synthetic variants of the
+  second (overlay, 720p30, range mismatch, muted, mirrored, looped, a 30 s
+  overlap), and 149 synthetic cases with known answers for the detector
+  (facecam composites over a static layout, a calm talking head, stills,
+  short overlaps). Other combinations should work but are untested.
+* **Different frame rates between the two files** (e.g. a 59.94 master against a
+  60 VOD) are not corrected for. The frame check may then only agree to within a
+  frame or two and come out unconfirmed; the seam test decides.
 * **No resume.** An interrupted merge restarts from zero. The recovered opening
   *is* cached and will not be re-encoded, as long as the offset and sources are
   unchanged.
@@ -434,20 +513,46 @@ three.
 * **Reading and writing the same removable card is pathologically slow.** Send
   the output to a different physical drive.
 
-## A note on the audio cross-check
+## Why the detector works the way it does
 
-If the audio and video analyses disagree by roughly the difference between the
-VOD's own per-stream start times, look there first. A VOD whose video track
-starts at 0.947 s while its audio track starts at 0.020 s will make a naive
-audio correlation — one that assumes the loudness envelope begins at t = 0 —
-report an offset that is most of a second too small.
+The first version correlated **motion energy** — how much each frame differs
+from the one before. On a fast-moving gaming stream that worked well. On an
+interview where three people stand and talk, it failed completely: motion was
+flat, the correlation was noise (0.455 against a runner-up of 0.432), and it
+picked an offset 67 seconds wrong. The sound, meanwhile, had the right answer
+the whole time and was being ignored.
 
-This tool keeps the absolute `pts_time` of every measurement on both the video
-and the audio path, so both analyses live in the same timeline. `analyze` prints
-the per-stream start times of both files so you can see it for yourself. If the
-two methods still disagree after that, and the fine pass reports a low mean
-pixel difference (< 2/255), trust the video answer and use `-AudioShift` to
-correct the opening's audio.
+It also had a second, independent flaw. It slid a 90-second piece of the master
+along the VOD and required it to fit entirely inside. On a 192-second VOD that
+cannot reach any offset past 101 seconds — and the real one was 111.47. No
+amount of signal quality would have fixed that.
+
+Three lessons are built into the current design:
+
+* **Candidates, then an independent check.** Sound and pictures only *suggest*;
+  a separate frame-by-frame check decides. A wrong suggestion costs a few
+  seconds of checking, never a wrong file.
+* **Judge a match against the moment's own motion.** The obvious confidence
+  measure — how much better the best match is than the runner-up — is useless
+  on still footage, where every frame resembles every other: it sat at about
+  1.35 whether the answer was right or wrong. A fixed distance limit is not
+  enough either: on a facecam over a static layout a *wrong* frame also scores
+  low (under 4/255), and two such moments once agreed on a wrong frame and
+  started the merge 46 seconds off. So a moment counts only when its difference
+  is small compared with how much that moment itself changes in a second — or
+  is near-perfect outright (0.4/255 or less), which very calm footage needs.
+  The VOD is first matched to the master's brightness and contrast, so a
+  colour-range mismatch no longer inflates the difference (10.4 → 1.5/255).
+  On 149 test cases with known answers this verified no wrong frame; the old
+  fixed limit verified 10. A frozen picture is never used at all.
+* **Keep absolute timestamps.** A VOD whose video track starts at 0.947 s while
+  its audio starts at 0.020 s will fool any correlation that assumes both begin
+  at zero. `analyze` prints each stream's start time so you can see it.
+
+If a verdict says `conflict` and the seam test at the picture offset joins
+cleanly but the voices in the recovered part are off, the VOD's own sound is out
+of step with its picture: merge at the picture offset with the `-AudioShift`
+value the analysis prints.
 
 ## Third-party software
 
